@@ -30,7 +30,8 @@ Usage inside SDK internals:
 
 User opt-in:
     import kubeflow.common.telemetry as telemetry
-    telemetry.configure(exporter="jaeger", endpoint="http://localhost:4317")
+    telemetry.configure(exporter="otlp", endpoint="http://localhost:4317")
+    # Note: Jaeger accepts OTLP natively on port 4317 — use exporter='otlp'
 """
 
 from __future__ import annotations
@@ -71,7 +72,7 @@ def _tracing_disabled() -> bool:
 def get_tracer(instrumentation_name: str = "kubeflow.sdk") -> Any:
     """Return a real OTel Tracer or a zero-overhead NoOp tracer.
 
-    Safe to call unconditionally in SDK internals. Returns _NoOpTracer
+    Safe to call unconditionally in SDK internals. Returns _NOOP_TRACER
     when opentelemetry-api is not installed, with zero allocation cost.
 
     Args:
@@ -80,10 +81,10 @@ def get_tracer(instrumentation_name: str = "kubeflow.sdk") -> Any:
 
     Returns:
         opentelemetry.trace.Tracer if OTel is available and tracing is
-        enabled, otherwise _NoOpTracer.
+        enabled, otherwise _NOOP_TRACER (module-level singleton).
     """
     if _tracing_disabled() or not _is_otel_available():
-        return _NoOpTracer()
+        return _NOOP_TRACER
     from opentelemetry import trace
 
     return trace.get_tracer(instrumentation_name)
@@ -100,7 +101,8 @@ def configure(
     SDK users who manage their own TracerProvider can skip this call entirely.
 
     Args:
-        exporter: One of otlp, jaeger, console.
+        exporter: One of "otlp", "console".
+            Note: Jaeger accepts OTLP natively on port 4317 — use exporter='otlp'.
         endpoint: Exporter endpoint URL.
         service_name: Service name reported in traces.
 
@@ -143,7 +145,7 @@ def _build_exporter(exporter: str, endpoint: str) -> Any:
         ImportError: If the required exporter package is missing.
         ValueError: If exporter name is unknown.
     """
-    if exporter in ("otlp", "jaeger"):
+    if exporter == "otlp":
         try:
             from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 
@@ -154,7 +156,7 @@ def _build_exporter(exporter: str, endpoint: str) -> Any:
         from opentelemetry.sdk.trace.export import ConsoleSpanExporter
 
         return ConsoleSpanExporter()
-    raise ValueError(f"Unknown exporter '{exporter}'. Choose: otlp, jaeger, console.")
+    raise ValueError(f"Unknown exporter '{exporter}'. Choose: otlp, console.")
 
 
 class SpanNames:
@@ -225,13 +227,23 @@ class _NoOpSpan:
     def end(self) -> None:
         pass
 
+    def is_recording(self) -> bool:
+        return False
+
+    def get_span_context(self):
+        return None
+
 
 class _NoOpTracer:
     """Tracer that produces _NoOpSpans. Zero overhead fallback."""
 
     @contextlib.contextmanager  # type: ignore[misc]
     def start_as_current_span(self, name: str, **kwargs: Any):  # type: ignore[return]
-        yield _NoOpSpan()
+        yield _NOOP_SPAN
 
     def start_span(self, name: str, **kwargs: Any) -> _NoOpSpan:
-        return _NoOpSpan()
+        return _NOOP_SPAN
+
+
+_NOOP_SPAN = _NoOpSpan()
+_NOOP_TRACER = _NoOpTracer()

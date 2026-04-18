@@ -15,17 +15,17 @@ Span hierarchy produced:
     kubeflow.sdk.trainer.train              [root]
     ├── kubeflow.sdk.trainer.get_runtime
     ├── kubeflow.sdk.trainer.create_trainjob
-    └── kubeflow.sdk.trainer.poll_status    [x N iterations]
-          attributes: poll.iteration, trainjob.status
-          events: status_check, job_reached_expected_status
+    └── kubeflow.sdk.trainer.poll_status    [single span — entire polling loop]
+          attributes: poll.timeout_seconds, poll.interval_seconds
+          events: status_check (×N iterations), job_reached_expected_status
 
 Run with console output (no Docker needed):
     pip install opentelemetry-sdk opentelemetry-exporter-otlp
     python examples/instrumented_trainer.py
 
-Run with Jaeger UI:
+Run with Jaeger UI (Jaeger accepts OTLP natively on port 4317):
     docker-compose up -d
-    python examples/instrumented_trainer.py
+    python examples/instrumented_trainer.py --exporter otlp
     open http://localhost:16686
 """
 
@@ -124,32 +124,35 @@ class InstrumentedTrainerBackend:
     def _poll_until_complete(
         self, job_name: str, timeout: int, polling_interval: int
     ) -> dict:
-        """Polling loop — each iteration gets its own child span.
+        """ONE span wraps the entire polling loop; each iteration emits a span event.
 
-        This is the technically hardest part of the instrumentation.
-        Each poll produces a child span with span events for status
-        transitions, giving full visibility without a single mega-span.
+        This avoids the N-spans-per-job problem (e.g. 300 spans for a 10-min job
+        polled every 2s). The single TRAINER_POLL_STATUS span carries timeout and
+        interval as attributes; per-iteration state is recorded via add_event().
         """
         status_progression = ["Created", "Created", "Running", "Running", "Complete"]
         max_iters = round(timeout / polling_interval)
 
-        for iteration in range(max_iters):
-            with self._tracer.start_as_current_span(SpanNames.TRAINER_POLL_STATUS) as poll_span:
-                poll_span.set_attribute(SpanAttributes.TRAINJOB_NAME, job_name)
-                poll_span.set_attribute(SpanAttributes.POLL_ITERATION, iteration)
-                poll_span.set_attribute(SpanAttributes.POLL_TIMEOUT, timeout)
-                poll_span.set_attribute(SpanAttributes.POLL_INTERVAL, polling_interval)
+        with self._tracer.start_as_current_span(SpanNames.TRAINER_POLL_STATUS) as poll_span:
+            poll_span.set_attribute(SpanAttributes.TRAINJOB_NAME, job_name)
+            poll_span.set_attribute(SpanAttributes.POLL_TIMEOUT, timeout)
+            poll_span.set_attribute(SpanAttributes.POLL_INTERVAL, polling_interval)
 
+            for iteration in range(max_iters):
                 time.sleep(0.02)
                 status = status_progression[min(iteration, len(status_progression) - 1)]
-                poll_span.set_attribute(SpanAttributes.TRAINJOB_STATUS, status)
+
                 poll_span.add_event(
                     "status_check",
-                    {SpanAttributes.TRAINJOB_STATUS: status, SpanAttributes.POLL_ITERATION: iteration},
+                    {
+                        SpanAttributes.TRAINJOB_STATUS: status,
+                        SpanAttributes.POLL_ITERATION: iteration,
+                    },
                 )
                 logger.info("  Poll %d: job=%s status=%s", iteration, job_name, status)
 
                 if status == "Complete":
+                    poll_span.set_attribute(SpanAttributes.TRAINJOB_STATUS, status)
                     poll_span.add_event("job_reached_expected_status")
                     return {"name": job_name, "status": status}
 
@@ -158,7 +161,7 @@ class InstrumentedTrainerBackend:
                     poll_span.record_exception(err)
                     raise err
 
-            time.sleep(polling_interval * 0.05)
+                time.sleep(polling_interval * 0.05)
 
         raise TimeoutError(f"Timeout waiting for TrainJob {job_name} after {timeout}s")
 
@@ -166,7 +169,7 @@ class InstrumentedTrainerBackend:
 if __name__ == "__main__":
     print("=" * 60)
     print("Kubeflow SDK OpenTelemetry PoC")
-    print("Span hierarchy: train → get_runtime → create → poll×N")
+    print("Span hierarchy: train → get_runtime → create → single poll_status span")
     print("=" * 60)
 
     backend = InstrumentedTrainerBackend(namespace="kubeflow")
@@ -182,5 +185,7 @@ if __name__ == "__main__":
     noop = get_tracer("test")
     with noop.start_as_current_span("test.span") as s:
         s.set_attribute("key", "value")
-    print("✓ NoOp tracer: zero overhead confirmed — no exceptions")
+        assert not s.is_recording(), "NoOp span must report is_recording()=False"
+        assert s.get_span_context() is None, "NoOp span must return None for get_span_context()"
+    print("✓ NoOp tracer: zero overhead confirmed — is_recording=False, get_span_context=None")
     print("\nDone. Check console output above for real OTel JSON spans.")
